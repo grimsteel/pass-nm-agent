@@ -1,14 +1,16 @@
 use std::{time::Duration, error::Error, sync::{Arc, Mutex}, collections::HashMap, marker::PhantomData};
 
-use dbus::{nonblock::{self, SyncConnection}, arg::{PropMap, RefArg, Variant}, Path, channel::MatchingReceiver, message::MatchRule, MethodErr};
+use dbus::{nonblock::{self, SyncConnection}, arg::{PropMap, Variant}, Path, channel::MatchingReceiver, message::MatchRule, MethodErr};
 use dbus_crossroads::Crossroads;
 use futures::future;
+use log::{debug, info};
 use tokio::task::AbortHandle;
 
-use crate::minipass::{read_passwd, delete_passwd, write_passwd};
+use crate::{error::PassNMError, minipass::{delete_passwd, read_passwd, write_passwd}, network_manager::{NetworkConnection, NetworkSecurity}};
 
-pub const PASS_DIR: &str = "wifi";
-pub const WIFI_SETTING_NAME: &str = "802-11-wireless-security";
+pub const PASS_DIR: &str = "network";
+
+const SECRET_AGENT_PATH: &str = "/org/freedesktop/NetworkManager/SecretAgent";
 
 pub type PropMapMap = HashMap<String, PropMap>;
 type ConnectionHandleMap = HashMap<(String, String), AbortHandle>;
@@ -17,73 +19,76 @@ fn invalid_arg<T>(err: &str) -> Result<T, MethodErr> {
     Err(MethodErr::invalid_arg(err))
 }
 
-// Returns ssid, key_mgmt, req_new, allow_interaction
-pub fn parse_connection_data<'a>(connection: &'a PropMapMap) -> Option<(&'a str, &'a str)> {
-    let ssid = connection.get("connection").and_then(|c| c.get("id")).and_then(|i| i.as_str());
-    let setting_data = connection.get(WIFI_SETTING_NAME);
-    // this indicates what type of wifi authentication (WPA-PSK, WPA-EAP, etc) the network uses
-    let key_mgmt = setting_data.and_then(|s| s.get("key-mgmt")).and_then(|i| i.as_str());
-
-    if let (Some(ssid), Some(key_mgmt)) = (ssid, key_mgmt) {
-        Some((ssid, key_mgmt))
-    } else {
-        None
-    }
-}
-
-pub async fn delete_passwd_from_connection(connection: &PropMapMap) -> Result<(), String> {
-    if let Some((ssid, key_mgmt)) = parse_connection_data(connection) {
-        delete_passwd(PASS_DIR, &format!("{}.{}", ssid, key_mgmt)).await?;
-        Ok(())
-    } else {
-        Err("invalid connection data".to_string())
-    }
-}
-
-// insert password into password storage and remove from `connection`
-async fn insert_passwd_from_connection(connection: &mut PropMapMap) -> Result<(), String> {
-    if let Some((ssid, key_mgmt)) = parse_connection_data(connection) {
-        match key_mgmt {
-            "wpa-psk" => {
-                let passwd_id = format!("{}.wpa-psk", ssid);
-                let wifi_settings = connection.get_mut(WIFI_SETTING_NAME).unwrap();
-                let psk = wifi_settings.get("psk").and_then(|i| i.as_str()).ok_or_else(|| "psk field does not exist")?;
-                write_passwd(PASS_DIR, &passwd_id, psk).await.map_err(|_| "could not store password")?;
-                // remove the password from `connection`
-                //wifi_settings.remove("psk");
-                //wifi_settings.insert("psk-flags".to_string(), Variant(Box::new(1 as u32)));
-                Ok(())
-            },
-            _ => Err("unsupported wifi key mgmt".to_string())
+pub async fn delete_stored_secrets(id: &str, security: &NetworkSecurity) -> Result<(), PassNMError> {
+    match security {
+        NetworkSecurity::WpaPsk { psk: _, flags: _ } => {
+            // Delete the psk
+            delete_passwd(PASS_DIR, &format!("{}.wpa-psk", id))
+                .await?;
+            Ok(())
         }
-    } else {
-        Err("invalid connection data".to_string())
     }
 }
 
-async fn handle_wifi_request(ssid: String, key_mgmt: String, allow_interaction: bool) -> Result<(PropMapMap, ), MethodErr> {
-    match key_mgmt.as_ref() {
-        "wpa-psk" => {
-            // now lookup the password
-            let key_id = format!("{}.wpa-psk", ssid);
-            match read_passwd(PASS_DIR, &key_id, allow_interaction).await {
-                Ok(password) => {
-                    // prepare the response hash map
-                    let mut response: HashMap<String, PropMap> = HashMap::new();
-                    let mut response_wifi = PropMap::new();
-                    response_wifi.insert("psk".to_string(), Variant(Box::new(password)));
-                    response.insert(WIFI_SETTING_NAME.to_string(), response_wifi);
-                    Ok((response, ))
-                },
-                Err(err) => {
-                    Err(MethodErr::failed(&err))
-                }
-            }
+// insert password into password storage
+pub async fn save_secrets(id: &str, security: &NetworkSecurity) -> Result<(), PassNMError> {
+    match security {
+        NetworkSecurity::WpaPsk { psk: Some(psk), flags: _ } => {
+            // Write the psk
+            write_passwd(PASS_DIR, &format!("{}.wpa-psk", id), &psk)
+                .await?;
+
+            Ok(())
         },
-        _ => {
-            // Unsupported wifi key management
-            invalid_arg("unsupported wifi key mgmt")
-        }
+        _ => Err(PassNMError::InvalidSecurity)
+    }
+}
+
+// Handle a request for secrets for a given network and setting name
+// Returns a secret response object
+async fn handle_secrets_request<'a>(network: Option<NetworkConnection<'a>>, setting_name: String, allow_interaction: bool) -> Result<(PropMapMap, ), MethodErr> {
+    debug!("handling request for {} for network {:?}", setting_name, network);
+
+    match network {
+        Some(NetworkConnection { id, security: Some(security), .. }) => {
+            // Current response item
+            let mut response_item = PropMap::new();
+            
+            match (setting_name.as_str(), security) {
+                // 802-11 with WPA-PSK and an agent-managed psk
+                ("802-11-wireless-security", NetworkSecurity::WpaPsk { psk: _, flags: 0x1 }) => {
+                    // Look the psk up
+                    match read_passwd(PASS_DIR, &format!("{}.wpa-psk", id), allow_interaction).await {
+                        Ok(psk) => {
+                            // Add the psk
+                            response_item.insert("psk".into(), Variant(Box::new(psk)));
+                        },
+                        Err(err) => {
+                            return Err(MethodErr::failed(&err));
+                        }
+                    }
+                },
+                _ => return invalid_arg("unsupported network security")
+            };
+
+            // Set up the response
+            let mut response = PropMapMap::new();
+            response.insert(setting_name.into(), response_item);
+            Ok((response, ))
+        },
+        Some(NetworkConnection { .. }) => invalid_arg("network does not have security"),
+        _ => invalid_arg("invalid network")
+    }
+}
+
+// Add a new req handler (optionally) to the handle map mutex and cancel existing ones
+fn add_new_req_handler(cr: &mut Crossroads, path: Path, setting_name: String, abort_handle: Option<AbortHandle>) {
+    let map_key = (path.to_string(), setting_name);
+    let handle_map: &mut ConnectionHandleMap = cr.data_mut(&Path::new(SECRET_AGENT_PATH).unwrap()).unwrap();
+
+    // If we got an actual new abort handle, insert it, otherwise just remove the old one
+    if let Some(old_handle) = match abort_handle { Some(h) => handle_map.insert(map_key, h), None => handle_map.remove(&map_key) } {
+        old_handle.abort();
     }
 }
 
@@ -91,7 +96,7 @@ pub async fn run_service(conn: Arc<SyncConnection>) -> Result<(), Box<dyn Error>
     // First register our service
     let nm_proxy = nonblock::Proxy::new("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager/AgentManager", Duration::from_secs(2), conn.clone());
     nm_proxy.method_call("org.freedesktop.NetworkManager.AgentManager", "Register", ("grimsteel.pass-nm-agent",)).await?;
-    println!("Registered network manager agent");
+    info!("Registered network manager agent");
 
     //conn.request_name("com.grimsteel.passnmagent", false, true, false).await?;
 
@@ -99,54 +104,39 @@ pub async fn run_service(conn: Arc<SyncConnection>) -> Result<(), Box<dyn Error>
 
     {
         let mut cr_lock = cr.lock().unwrap();
-        let cr2 = cr.clone();
-        let cr3 = cr.clone();
         let conn = conn.clone();
 
         // Enable async support
         cr_lock.set_async_support(Some((conn.clone(), Box::new(|fut| { tokio::spawn(fut); } ))));
 
         let iface_token = cr_lock.register("org.freedesktop.NetworkManager.SecretAgent", |builder| {
-            //let existing_reqs = existing_reqs.clone();
+            // Get secrets from pass
             builder.method_with_cr_async(
                 "GetSecrets",
                 ("connection", "connection_path", "setting_name", "hints", "flags"),
                 ("secrets",),
-                move |mut ctx, _cr, (connection, _connection_path, setting_name, _hints, flags): (PropMapMap, Path, String, Vec<String>, u32)| {
-                    let cr = cr2.clone();
-                    async move {
-                        // We only support wifi
-                        if setting_name == WIFI_SETTING_NAME {
-                            let req_new = flags & 0x2 == 0x2;
-                            let allow_interaction = req_new || flags & 0x1 == 0x1;
-                            if let Some((ssid, key_mgmt)) = parse_connection_data(&connection) {
-                                let handle = tokio::spawn(handle_wifi_request(ssid.to_string(), key_mgmt.to_string(), allow_interaction));
+                move |mut ctx, cr, (connection, connection_path, setting_name, _hints, flags): (PropMapMap, Path, String, Vec<String>, u32)| {
+                    info!("GetSecrets: {} for {}", setting_name, connection_path);
+                    
+                    // Allow interaction if 0b1 (allow interaction) or 0b10 (prompt for new) is set
+                    let allow_interaction = (flags & 0b11) > 0;
 
-                                {
-                                    // Cancel any existing tasks (network manager should NOT let this ever happen)
-                                    let mut cr_lock = cr.lock().unwrap();
-                                    let map_key = (ssid.to_string(), key_mgmt.to_string());
-                                    let existing_reqs: &mut ConnectionHandleMap = cr_lock.data_mut(ctx.path()).unwrap();
-                                    if let Some(abort_handle) = existing_reqs.remove(&map_key) {
-                                        abort_handle.abort();
-                                    }
-                                
-                                    existing_reqs.insert(map_key, handle.abort_handle());
-                                }
-                                
-                                if let Ok(data) = handle.await {
-                                    ctx.reply(data)
-                                } else {
-                                    // If the task itself failed, don't respond at all
-                                    PhantomData
-                                }
+                    let network = NetworkConnection::try_from((connection_path.clone(), connection));
+                        let handle = tokio::spawn(handle_secrets_request(network.ok(), setting_name.clone(), allow_interaction));
+
+                        // Cancel existing requests
+                        add_new_req_handler(cr, connection_path, setting_name, Some(handle.abort_handle()));
+
+                        async move {
+                            if let Ok(data) = handle.await {
+                                ctx.reply(data)
                             } else {
-                                ctx.reply(invalid_arg("not all data is present in connection map"))
+                                // No response
+                                PhantomData
                             }
-                        } else {
-                            ctx.reply(invalid_arg("only 802.11 wireless security is supported"))
                         }
-                    }                
+                    
+
                 }
             );
 
@@ -154,36 +144,14 @@ pub async fn run_service(conn: Arc<SyncConnection>) -> Result<(), Box<dyn Error>
                 "CancelGetSecrets",
                 ("connection_path", "setting_name"),
                 (),
-                move |mut ctx, _cr, (connection_path, setting_name): (Path, String)| {
-                    let cr = cr3.clone();
-                    let conn = conn.clone();
+                move |mut ctx, cr, (connection_path, setting_name): (Path, String)| {
+                    info!("CancelGetSecrets: {} for {}", setting_name, connection_path);
+                    
+                    // Just cancel existing reqs
+                    add_new_req_handler(cr, connection_path, setting_name, None);
+                    
                     async move {
-                        if setting_name == WIFI_SETTING_NAME {
-                            // Get more conn info from NetworkManager
-                            let proxy = nonblock::Proxy::new("org.freedesktop.NetworkManager", connection_path, Duration::from_secs(2), conn.clone());
-                            if let Some((ssid, key_mgmt)) = proxy
-                                .method_call::<(PropMapMap,), _, _, _>("org.freedesktop.NetworkManager.Settings.Connection", "GetSettings", ())
-                                .await
-                                .ok()
-                                .as_ref()
-                                // extract the ssid and key mgmt out of it
-                                .and_then(|(d ,)| parse_connection_data(d))
-                            {
-                                {
-                                    let mut cr_lock = cr.lock().unwrap();
-                                    let existing_reqs: &mut ConnectionHandleMap = cr_lock.data_mut(ctx.path()).unwrap();
-                                    // find it and abort it
-                                    if let Some(handle) = existing_reqs.remove(&(ssid.to_string(), key_mgmt.to_string())) {
-                                        handle.abort();
-                                    }
-                                }
-                                ctx.reply(Ok(()))
-                            } else {
-                                ctx.reply(invalid_arg("invalid or nonexistent connection"))
-                            }
-                        } else {
-                            ctx.reply(invalid_arg("only 802.11 wireless security is supported"))
-                        }
+                        ctx.reply(Ok(()))
                     }
                 }
             );
@@ -192,9 +160,17 @@ pub async fn run_service(conn: Arc<SyncConnection>) -> Result<(), Box<dyn Error>
                 "DeleteSecrets",
                 ("connection", "connection_path"),
                 (),
-                |mut ctx, _cr, (connection, _connection_path): (PropMapMap, Path)| {
+                |mut ctx, _cr, (connection, connection_path): (PropMapMap, Path)| {
+                    info!("DeleteSecrets: for {}", connection_path);
                     async move {
-                        ctx.reply(delete_passwd_from_connection(&connection).await.map_err(|e| MethodErr::failed(&e)))
+                        ctx.reply(match (connection_path, connection).try_into() {
+                            // NetworkConnection with security
+                            Ok(NetworkConnection { id, security: Some(security), .. }) => delete_stored_secrets(&id, &security).await.map_err(|e| MethodErr::failed(&e)),
+                            // any other NetworkConnection
+                            Ok(_network) => Err(MethodErr::invalid_arg("network does not use secrets")),
+                            // Error
+                            Err(e) => Err(MethodErr::invalid_arg(&e))
+                        })
                     }
                 }
             );
@@ -203,21 +179,29 @@ pub async fn run_service(conn: Arc<SyncConnection>) -> Result<(), Box<dyn Error>
                 "SaveSecrets",
                 ("connection", "connection_path"),
                 (),
-                |mut ctx, _cr, (mut connection, _connection_path): (PropMapMap, Path)| {
+                |mut ctx, _cr, (connection, connection_path): (PropMapMap, Path)| {
+                    info!("SaveSecrets: for {}", connection_path);
                     async move {
-                        ctx.reply(insert_passwd_from_connection(&mut connection).await.map_err(|e| MethodErr::failed(&e)))
+                        ctx.reply(match (connection_path, connection).try_into() {
+                            // NetworkConnection with security
+                            Ok(NetworkConnection { id, security: Some(security), .. }) => save_secrets(&id, &security).await.map_err(|e| MethodErr::failed(&e)),
+                            // any other NetworkConnection
+                            Ok(_network) => Err(MethodErr::invalid_arg("network does not use secrets")),
+                            // Error
+                            Err(e) => Err(MethodErr::invalid_arg(&e))
+                        })
                     }
                 }
             );
         });
 
-        cr_lock.insert("/org/freedesktop/NetworkManager/SecretAgent", &[iface_token], ConnectionHandleMap::new());
+        // Set up the SecretAgent path with an empty connectio handle map
+        cr_lock.insert(SECRET_AGENT_PATH, &[iface_token], ConnectionHandleMap::new());
     }
 
     // Start listening
     conn.start_receive(MatchRule::new_method_call(), Box::new(move |msg, conn| {
-        let mut cr_lock = cr.lock().unwrap();
-        cr_lock.handle_message(msg, conn).unwrap();
+        cr.lock().unwrap().handle_message(msg, conn).unwrap();
         true
     }));
 
