@@ -1,0 +1,8 @@
+[Unit]
+Description=NetworkManager secret agent for pass
+
+[Service]
+ExecStart=/usr/local/bin/pass-nm-agent agent
+
+[Install]
+WantedBy=default.target
