@@ -13,6 +13,8 @@ jobs:
         name: Checkout
       - uses: dtolnay/rust-toolchain@stable
         name: Setup rust
+      - run: sudo apt install libdbus-1-dev pkg-config
+        name: Install libdbus
       - run: cargo build --release
         name: Build
       - name: Release
