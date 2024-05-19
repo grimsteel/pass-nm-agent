@@ -6,7 +6,7 @@ use futures::future;
 use log::{debug, info};
 use tokio::task::AbortHandle;
 
-use crate::{error::PassNMError, minipass::{delete_passwd, read_passwd, write_passwd}, network_manager::{NetworkConnection, NetworkSecurity}};
+use crate::{error::PassNMError, minipass::{delete_passwd, read_passwd, write_passwd}, network_manager::{NetworkConnection, NetworkSecurity, PwWithFlags}};
 
 pub const PASS_DIR: &str = "network";
 
@@ -21,10 +21,25 @@ fn invalid_arg<T>(err: &str) -> Result<T, MethodErr> {
 
 pub async fn delete_stored_secrets(id: &str, security: &NetworkSecurity) -> Result<(), PassNMError> {
     match security {
-        NetworkSecurity::WpaPsk { psk: _, flags: _ } => {
+        NetworkSecurity::WpaPsk(..) => {
             // Delete the psk
             delete_passwd(PASS_DIR, &format!("{}.wpa-psk", id))
                 .await?;
+            Ok(())
+        },
+        NetworkSecurity::WpaEap { client_cert_pw, private_key_pw, password } => {
+            // Delete the password
+            if password.flags == 0x1 {
+                delete_passwd(PASS_DIR, &format!("{}.wpa-eap-password", id)).await?;
+            }
+            // Delete the client cert pw
+            if client_cert_pw.flags == 0x1 {
+                delete_passwd(PASS_DIR, &format!("{}.wpa-eap-client-cert-password", id)).await?;
+            }
+            // Delete the private key pw
+            if private_key_pw.flags == 0x1 {
+                delete_passwd(PASS_DIR, &format!("{}.wpa-eap-private-key-password", id)).await?;
+            }
             Ok(())
         }
     }
@@ -33,15 +48,41 @@ pub async fn delete_stored_secrets(id: &str, security: &NetworkSecurity) -> Resu
 // insert password into password storage
 pub async fn save_secrets(id: &str, security: &NetworkSecurity) -> Result<(), PassNMError> {
     match security {
-        NetworkSecurity::WpaPsk { psk: Some(psk), flags: _ } => {
+        NetworkSecurity::WpaPsk(PwWithFlags{ pw: Some(psk), .. }) => {
             // Write the psk
             write_passwd(PASS_DIR, &format!("{}.wpa-psk", id), &psk)
                 .await?;
 
             Ok(())
         },
+        NetworkSecurity::WpaEap { client_cert_pw, private_key_pw, password } => {
+            if let Some(password) = &password.pw {
+                write_passwd(PASS_DIR, &format!("{}.wpa-eap-password", id), &password).await?;
+            }
+            if let Some(password) = &client_cert_pw.pw {
+                write_passwd(PASS_DIR, &format!("{}.wpa-eap-client-cert-password", id), &password).await?;
+            }
+            if let Some(password) = &private_key_pw.pw {
+                write_passwd(PASS_DIR, &format!("{}.wpa-eap-private-key-password", id), &password).await?;
+            }
+            Ok(())
+        }
         _ => Err(PassNMError::InvalidSecurity)
     }
+}
+
+async fn read_single_secret(network_id: &str, secret_ext: &str, secret_field: &str, allow_interaction: bool, response_item: &mut PropMap) -> Result<(), MethodErr> {
+    match read_passwd(PASS_DIR, &format!("{}.{}", network_id, secret_ext), allow_interaction).await {
+         Ok(password) => {
+             // Add the password
+             response_item.insert(secret_field.into(), Variant(Box::new(password)));
+         },
+         Err(err) => {
+             return Err(MethodErr::failed(&err));
+         }
+    }
+
+    Ok(())
 }
 
 // Handle a request for secrets for a given network and setting name
@@ -51,21 +92,31 @@ async fn handle_secrets_request<'a>(network: Option<NetworkConnection<'a>>, sett
 
     match network {
         Some(NetworkConnection { id, security: Some(security), .. }) => {
+            // Make sure the setting name matches the security
+            if setting_name != security.get_secret_setting_name() {
+                return invalid_arg("setting name does not match security");
+            }
+                
             // Current response item
             let mut response_item = PropMap::new();
             
-            match (setting_name.as_str(), security) {
+            match security {
                 // 802-11 with WPA-PSK and an agent-managed psk
-                ("802-11-wireless-security", NetworkSecurity::WpaPsk { psk: _, flags: 0x1 }) => {
+                NetworkSecurity::WpaPsk(PwWithFlags { flags: 0x1, .. }) => {
                     // Look the psk up
-                    match read_passwd(PASS_DIR, &format!("{}.wpa-psk", id), allow_interaction).await {
-                        Ok(psk) => {
-                            // Add the psk
-                            response_item.insert("psk".into(), Variant(Box::new(psk)));
-                        },
-                        Err(err) => {
-                            return Err(MethodErr::failed(&err));
-                        }
+                    read_single_secret(&id, "wpa-psk", "psk", allow_interaction, &mut response_item).await?;
+                },
+                // 802-1x
+                NetworkSecurity::WpaEap { client_cert_pw, private_key_pw, password } => {
+                    // Handle all agent managed items
+                    if client_cert_pw.flags == 0x1 {
+                        read_single_secret(&id, "wpa-eap-client-cert-password", "client-cert-password", allow_interaction, &mut response_item).await?;
+                    }
+                    if private_key_pw.flags == 0x1 {
+                        read_single_secret(&id, "wpa-eap-private-key-password", "private-key-password", allow_interaction, &mut response_item).await?;
+                    }
+                    if password.flags == 0x1 {
+                        read_single_secret(&id, "wpa-eap-password", "password", allow_interaction, &mut response_item).await?;
                     }
                 },
                 _ => return invalid_arg("unsupported network security")

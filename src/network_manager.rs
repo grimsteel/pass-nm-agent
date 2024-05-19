@@ -35,16 +35,25 @@ impl<'a> TryFrom<(Path<'a>, PropMapMap)> for NetworkConnection<'a> {
     }
 }
 
+
+#[derive(Debug)]
+pub struct PwWithFlags {
+    pub pw: Option<String>,
+    pub flags: u32
+}
+
 #[derive(Debug)]
 pub enum NetworkSecurity {
-    WpaPsk { psk: Option<String>, flags: u32 }
+    WpaPsk(PwWithFlags),
+    WpaEap { client_cert_pw: PwWithFlags, private_key_pw: PwWithFlags, password: PwWithFlags }
 }
 
 impl NetworkSecurity {
     // Get the setting name for GetSecrets
-    fn get_secret_setting_name(&self) -> String {
+    pub fn get_secret_setting_name(&self) -> String {
         match self {
-            Self::WpaPsk { .. } => "802-11-wireless-security".into()
+            Self::WpaPsk(..) => "802-11-wireless-security".into(),
+            Self::WpaEap { .. } => "802-1x".into()
         }
     }
 }
@@ -65,18 +74,19 @@ impl TryFrom<(&PropMapMap, &PropMapMap)> for NetworkSecurity {
             // PSK or EAP
             match wifi_data.get("key-mgmt").and_then(|km| km.as_str()) {
                 Some("wpa-psk") => {
-                    // We need to get this one from the secrets item
-                    let psk = wifi_secrets.get("psk")
-                        .and_then(|psk| psk.as_str())
-                        // return None if it's empty
-                        .and_then(|s| { if s.is_empty() { None } else { Some(s.to_string()) } });
-                    
-                    let psk_flags = wifi_data.get("psk-flags")
-                        // cast to u32
-                        .and_then(|flags| flags.as_u64())
-                        .map(|flags| flags as u32)
-                        .unwrap_or_default();
-                    Ok(NetworkSecurity::WpaPsk { psk, flags: psk_flags })
+                    Ok(NetworkSecurity::WpaPsk(parse_pw_with_flags(wifi_data, wifi_secrets, "psk")))
+                },
+                Some("wpa-eap") => {
+                    // Get the 802.1x information
+                    if let (Some(wifi_8021x_secrets), Some(wifi_8021x)) = (secrets.get("802-1x"), connection.get("802-1x")) {
+                        Ok(NetworkSecurity::WpaEap {
+                            password: parse_pw_with_flags(wifi_8021x, wifi_8021x_secrets, "password"),
+                            client_cert_pw: parse_pw_with_flags(wifi_8021x, wifi_8021x_secrets, "client-cert-password"),
+                            private_key_pw: parse_pw_with_flags(wifi_8021x, wifi_8021x_secrets, "private-key-password")
+                        })
+                    } else {
+                        Err(PassNMError::InvalidSecurity)
+                    }
                 },
                 _ => Err(PassNMError::InvalidSecurity)
             }
@@ -84,6 +94,20 @@ impl TryFrom<(&PropMapMap, &PropMapMap)> for NetworkSecurity {
             Err(PassNMError::InvalidSecurity)
         }
     }
+}
+
+fn parse_pw_with_flags(settings: &PropMap, secrets: &PropMap, setting_name: &str) -> PwWithFlags {
+    let pw = secrets.get(setting_name)
+        .and_then(|pw| pw.as_str())
+        .and_then(|s| { if s.is_empty() { None } else { Some(s.to_string()) } } );
+
+    // Get the flags
+    let pw_flags = settings.get(&format!("{}-flags", setting_name))
+        .and_then(|flags| flags.as_u64())
+        .map(|flags| flags as u32)
+        .unwrap_or_default();
+
+    PwWithFlags { pw, flags: pw_flags }
 }
 
 fn make_proxy<'a, P: Into<Path<'a>>>(conn: Conn, path: P) -> Proxy<'a, Conn> {
@@ -167,33 +191,47 @@ pub async fn get_network_security_secrets<'a>(conn: Conn, network: &NetworkConne
 }
 
 // Set all secrets to agent-managed in a NetworkManager Connection Settings
-pub async fn make_agent_managed<'a>(conn: Conn, network: NetworkConnection<'a>) -> Result<(), PassNMError> {
+pub async fn make_agent_managed<'a>(conn: Conn, network: NetworkConnection<'a>, full_secrets: &NetworkSecurity) -> Result<(), PassNMError> {
     // Make the settings mutable so we can set it to agent managed
     let mut settings = network.settings;
+
+    // 1 = agent managed
+    let agent_managed: Box<dyn RefArg> = Box::new(1 as u32);
+
+    let item_settings = settings.get_mut(&full_secrets.get_secret_setting_name()).expect("should have this item");
+
     // Figure out what security it uses
-    if let Some(security) = network.security {
-        match security {
-            NetworkSecurity::WpaPsk { psk: _, flags: _ } => {
-                settings.get_mut("802-11-wireless-security")
-                    .expect("Should have 802-11-wireless-security")
-                    .insert(
-                        "psk-flags".into(),
-                        // 1 = agent managed
-                        Variant(Box::new(1 as u32))
-                    );
+    match full_secrets {
+        NetworkSecurity::WpaPsk(..) => {
+            item_settings
+                .insert(
+                    "psk-flags".into(),
+                    Variant(agent_managed)
+                );
+        },
+        NetworkSecurity::WpaEap { client_cert_pw, private_key_pw, password } => {
+            // If there was a client cert pw
+            if client_cert_pw.pw.is_some() {
+                item_settings.insert("client-cert-password-flags".into(), Variant(agent_managed.box_clone()));
+            }
+
+            if private_key_pw.pw.is_some() {
+                item_settings.insert("private-key-password-flags".into(), Variant(agent_managed.box_clone()));
+            }
+
+            if password.pw.is_some() {
+                item_settings.insert("password-flags".into(), Variant(agent_managed));
             }
         }
-
-        // Update in NetworkManager
-        make_proxy(conn, network.path)
-            .method_call(
-                "org.freedesktop.NetworkManager.Settings.Connection",
-                "Update",
-                (settings, )
-            ).await.map_err(|e| PassNMError::DbusError(e))?;
-        
-        Ok(())
-    } else {
-        Err(PassNMError::InvalidSecurity)
     }
+
+    // Update in NetworkManager
+    make_proxy(conn, network.path)
+        .method_call(
+            "org.freedesktop.NetworkManager.Settings.Connection",
+            "Update",
+            (settings, )
+        ).await.map_err(|e| PassNMError::DbusError(e))?;
+    
+    Ok(())
 }

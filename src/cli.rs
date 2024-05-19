@@ -21,7 +21,7 @@ pub async fn insert_network(conn: Conn, network: &str) -> Result<(), PassNMError
     save_secrets(&network.id, &secrets).await?;
 
     // Remove from NetworkManager
-    make_agent_managed(conn, network).await?;
+    make_agent_managed(conn, network, &secrets).await?;
 
     Ok(())
 }
