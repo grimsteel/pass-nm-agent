@@ -1,12 +1,12 @@
 use std::{time::Duration, error::Error, sync::{Arc, Mutex}, collections::HashMap, marker::PhantomData};
 
-use dbus::{nonblock::{self, SyncConnection}, arg::{PropMap, Variant}, Path, channel::MatchingReceiver, message::MatchRule, MethodErr};
+use dbus::{arg::{PropMap, RefArg, Variant}, channel::MatchingReceiver, message::MatchRule, nonblock::{self, SyncConnection}, MethodErr, Path};
 use dbus_crossroads::Crossroads;
 use futures::future;
 use log::{debug, info};
 use tokio::task::AbortHandle;
 
-use crate::{error::PassNMError, minipass::{delete_passwd, read_passwd, write_passwd}, network_manager::{NetworkConnection, NetworkSecurity, PwWithFlags}};
+use crate::{b64url::to_base64url, error::PassNMError, minipass::{delete_passwd, read_passwd, write_passwd}, model::{NetworkConnection, NetworkSecurity, PwWithFlags}};
 
 pub const PASS_DIR: &str = "network";
 
@@ -41,6 +41,20 @@ pub async fn delete_stored_secrets(id: &str, security: &NetworkSecurity) -> Resu
                 delete_passwd(PASS_DIR, &format!("{}.wpa-eap-private-key-password", id)).await?;
             }
             Ok(())
+        },
+        NetworkSecurity::Wireguard { private_key, peer_psks } => {
+            // Delete the privkey
+            if private_key.flags == 0x1 {
+                delete_passwd(PASS_DIR, &format!("{}.wg-private-key", id)).await?;
+            }
+            // Delete all peer psks
+            for (pubkey, psk) in peer_psks {
+                if psk.flags == 0x1 {
+                    delete_passwd(PASS_DIR, &format!("{}.{}.wg-preshared-key", id, to_base64url(pubkey))).await?;
+                }
+            }
+
+            Ok(())
         }
     }
 }
@@ -66,7 +80,19 @@ pub async fn save_secrets(id: &str, security: &NetworkSecurity) -> Result<(), Pa
                 write_passwd(PASS_DIR, &format!("{}.wpa-eap-private-key-password", id), &password).await?;
             }
             Ok(())
-        }
+        },
+        NetworkSecurity::Wireguard { private_key, peer_psks } => {
+            if let Some(private_key) = &private_key.pw {
+                write_passwd(PASS_DIR, &format!("{}.wg-private-key", id), &private_key).await?;
+            }
+            // all peer psks
+            for (pubkey, psk) in peer_psks {
+                if let Some(psk) = &psk.pw {
+                    write_passwd(PASS_DIR, &format!("{}.{}.wg-preshared-key", id, to_base64url(pubkey)), &psk).await?;
+                }
+            }
+            Ok(())
+        },
         _ => Err(PassNMError::InvalidSecurity)
     }
 }
@@ -118,6 +144,27 @@ async fn handle_secrets_request<'a>(network: Option<NetworkConnection<'a>>, sett
                     if password.flags == 0x1 {
                         read_single_secret(&id, "wpa-eap-password", "password", allow_interaction, &mut response_item).await?;
                     }
+                },
+                NetworkSecurity::Wireguard { private_key, peer_psks } => {
+                    debug!("{:#?} {:#?}", private_key, peer_psks);
+                    if private_key.flags == 0x1 {
+                        read_single_secret(&id, "wg-private-key", "private-key", allow_interaction, &mut response_item).await?;
+                    }
+
+                    // Handle psks
+                    let mut peers: Vec<PropMap> = Vec::with_capacity(peer_psks.len());
+                    for (pubkey, psk) in peer_psks {
+                        if psk.flags == 0x1 {
+                            let mut map = PropMap::new();
+                            if read_single_secret(&id, &format!("{}.wg-preshared-key", to_base64url(&pubkey)), "preshared-key", allow_interaction, &mut map).await.is_ok() {
+                                // Add this peer to our peers list
+                                map.insert("public-key".into(), Variant(Box::new(pubkey)));
+                                peers.push(map);
+                            }
+                        } 
+                    }
+
+                    response_item.insert("peers".into(), Variant(Box::new(peers) as Box<dyn RefArg>));
                 },
                 _ => return invalid_arg("unsupported network security")
             };

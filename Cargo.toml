@@ -18,6 +18,7 @@ dbus-crossroads = "0.5.2"
 dbus-tokio = { version = "0.7.6", features = ["dbus-crossroads"] }
 env_logger = "0.11.3"
 futures = "0.3.30"
+itertools = "0.13.0"
 log = "0.4.21"
 pico-args = "0.5.0"
 tokio = { version = "1.36.0", features = ["macros", "time", "rt-multi-thread", "process", "fs", "io-util"] }

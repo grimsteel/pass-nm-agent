@@ -1,4 +1,4 @@
-use crate::{error::PassNMError, network_manager::{get_network_by_name, get_network_security_secrets, make_agent_managed, Conn}, service::{delete_stored_secrets, save_secrets}};
+use crate::{error::PassNMError, network_manager::{get_network_by_name, get_network_security_secrets, make_agent_managed}, service::{delete_stored_secrets, save_secrets}, model::Conn};
 
 // delete a network from pass but not from network manager
 pub async fn delete_network(conn: Conn, network: &str) -> Result<(), PassNMError> {

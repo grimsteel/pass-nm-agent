@@ -2,7 +2,9 @@ mod minipass;
 mod service;
 mod cli;
 mod network_manager;
+mod model;
 mod error;
+mod b64url;
 
 use std::{error::Error, process::exit, sync::Arc};
 
